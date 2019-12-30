@@ -1,0 +1,208 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
+using Newtonsoft.Json;
+
+[assembly: InternalsVisibleTo("Finbourne.SdkConfig.Tests")]
+namespace Finbourne.SdkConfig.TokenProvider
+{
+    /// <summary>
+    /// Implementation of a TokenProvider for the ClientCredentialsFlow - where the credentials are usually sourced from a "secrets.json" file 
+    /// </summary>
+    public class ClientCredentialsFlowTokenProvider : ITokenProvider
+    {
+        private readonly ITokenProviderParameters _apiConfig;
+
+        private AuthenticationToken _lastIssuedToken;
+
+        /// <summary>
+        /// Constructor
+        /// </summary>
+        public ClientCredentialsFlowTokenProvider(ITokenProviderParameters configuration)
+        {
+            if (configuration == null) throw new ArgumentNullException(nameof(configuration));
+            
+            _apiConfig = configuration;
+        }
+
+        /// <inheritdoc />
+        public async Task<string> GetAuthenticationTokenAsync()
+        {
+            if (_lastIssuedToken == null || _lastIssuedToken.ExpiresOn < DateTimeOffset.UtcNow)
+            {
+                if (_lastIssuedToken?.RefreshToken != null)
+                {
+                    _lastIssuedToken = await RefreshToken(_apiConfig, _lastIssuedToken.RefreshToken);
+                }
+                else
+                {
+                    _lastIssuedToken = await GetNewToken(_apiConfig);
+                }
+            }
+
+            return _lastIssuedToken.Token;
+        }
+
+        /// <inheritdoc />
+        public async Task<AuthenticationHeaderValue> GetAuthenticationHeaderAsync()
+        {
+            string token = await GetAuthenticationTokenAsync();
+            return new AuthenticationHeaderValue("Bearer", token);
+        }
+
+        /// <summary>
+        /// Get a new token from Okta
+        /// </summary>
+        private static async Task<AuthenticationToken> GetNewToken(ITokenProviderParameters apiConfig)
+        {
+            using (var httpClient = new HttpClient())
+            {
+                // Only accept JSON
+                httpClient.DefaultRequestHeaders.Accept.Clear();
+                httpClient.DefaultRequestHeaders.Accept.Add(
+                    new MediaTypeWithQualityHeaderValue("application/json"));
+
+                // Build parameters
+                var parameters = new Dictionary<string, string>();
+                parameters["grant_type"] = "password";
+                parameters["username"] = apiConfig.Username;
+                parameters["password"] = apiConfig.Password;
+                parameters["client_id"] = apiConfig.ClientId;
+                parameters["client_secret"] = apiConfig.ClientSecret;
+                parameters["scope"] = apiConfig.Scope;
+
+                if (apiConfig.AdditionalParameters != null)
+                {
+                    foreach (var kvp in apiConfig.AdditionalParameters)
+                    {
+                        parameters[kvp.Key] = kvp.Value;
+                    }
+                }
+
+                var tokenRequest =
+                    new HttpRequestMessage(HttpMethod.Post, apiConfig.TokenUrl)
+                    {
+                        Content = new FormUrlEncodedContent(parameters)
+                    };
+
+                tokenRequest.Content.Headers.ContentType =
+                    new MediaTypeHeaderValue("application/x-www-form-urlencoded");
+
+                // Send request
+                var response = await httpClient.SendAsync(tokenRequest);
+                var body = await response.Content.ReadAsStringAsync();
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    throw new HttpRequestException(
+                        $"Could not retrieve an authentication token from the specified identity provider. The request to {tokenRequest.RequestUri} returned an unsuccessful status code of {response.StatusCode} and the response body: {body}");
+                }
+
+                var parsed = JsonConvert.DeserializeObject<Dictionary<string, string>>(body);
+
+                var apiToken = parsed["access_token"];                
+                var expires = parsed["expires_in"];
+
+                parsed.TryGetValue("refresh_token", out var refresh_token);
+
+                DateTimeOffset expiresAt;
+                if (int.TryParse(expires, out int expiresSeconds))
+                {
+                    // expiration is shorten to overcome a race condition where the token is still valid when retrieved from cache but expired when used
+                    expiresAt = DateTimeOffset.UtcNow.AddSeconds(expiresSeconds - 30);
+                }
+                else
+                {
+                    throw new InvalidOperationException("Failed to parse expires_in: " + expires);
+                }
+
+                return new AuthenticationToken(apiToken, expiresAt, refresh_token);
+            }
+        }
+
+        /// <summary>
+        /// Assuming we already have a token, then refresh it
+        /// </summary>
+        private static async Task<AuthenticationToken> RefreshToken(ITokenProviderParameters apiConfig, string refreshToken)
+        {
+            using (var httpClient = new HttpClient())
+            {
+                // Only accept JSON
+                httpClient.DefaultRequestHeaders.Accept.Clear();
+                httpClient.DefaultRequestHeaders.Accept.Add(
+                    new MediaTypeWithQualityHeaderValue("application/json"));
+
+                // Build parameters
+                var parameters = new Dictionary<string, string>();
+                parameters["grant_type"] = "refresh_token";
+                parameters["scope"] = "openid client groups offline_access";
+                parameters["refresh_token"] = refreshToken;
+
+                var tokenRequest =
+                    new HttpRequestMessage(HttpMethod.Post, apiConfig.TokenUrl)
+                    {
+                        Content = new FormUrlEncodedContent(parameters)
+                    };
+
+                tokenRequest.Content.Headers.ContentType =
+                    new MediaTypeHeaderValue("application/x-www-form-urlencoded");
+                tokenRequest.Headers.Authorization = new AuthenticationHeaderValue("Basic", Base64Encode($"{apiConfig.ClientId}:{apiConfig.ClientSecret}"));
+
+                // Send request
+                var response = await httpClient.SendAsync(tokenRequest);
+                var body = await response.Content.ReadAsStringAsync();
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    throw new HttpRequestException(
+                        $"Could not refresh the authentication token from the specified identity provider. The request to {tokenRequest.RequestUri} returned an unsuccessful status code of {response.StatusCode} and the response body: {body}");
+                }
+
+                var parsed = JsonConvert.DeserializeObject<Dictionary<string, string>>(body);
+
+                var apiToken = parsed["access_token"];                
+                var expires = parsed["expires_in"];
+
+                parsed.TryGetValue("refresh_token", out var refresh_token);
+
+                DateTimeOffset expiresAt;
+                if (int.TryParse(expires, out int expiresSeconds))
+                {
+                    // expiration is shorten to overcome a race condition where the token is still valid when retrieved from cache but expired when used
+                    expiresAt = DateTimeOffset.UtcNow.AddSeconds(expiresSeconds - 30);
+                }
+                else
+                {
+                    throw new InvalidOperationException("Failed to parse expires_in: " + expires);
+                }
+
+                return new AuthenticationToken(apiToken, expiresAt, refresh_token);
+            }
+        }
+
+        private static string Base64Encode(string plainText) 
+        {
+            var plainTextBytes = System.Text.Encoding.UTF8.GetBytes(plainText);
+            return Convert.ToBase64String(plainTextBytes);
+        }
+
+        /// <summary>
+        /// Returns the most recently issued token
+        /// </summary>
+        public AuthenticationToken GetLastToken()
+        {
+            return _lastIssuedToken;
+        }
+
+        /// <summary>
+        /// Used by TokenProviderTests to simulate an expired token
+        /// </summary>
+        internal void ExpireToken()
+        {
+            _lastIssuedToken.ExpiresOn = DateTimeOffset.UtcNow.AddSeconds(-1);
+        }
+    }
+}
